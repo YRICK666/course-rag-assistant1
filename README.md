@@ -1,4 +1,4 @@
-﻿# Course RAG Assistant
+# Course RAG Assistant
 
 面向课程资料的本地 RAG 学习助手。按科目管理课程资料，将 PPT、PDF、Word、TXT 等文件解析为可检索向量知识库，通过 React + FastAPI 提供智能问答、资料概览、复习提纲、自测题生成、长文分析等功能，并保留来源引用方便核对。
 
@@ -38,48 +38,38 @@
 
 PowerShell on Windows:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-```
+    python -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    pip install -r requirements.txt
+    Copy-Item .env.example .env
+    python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 
 Linux / macOS:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-```
+    python -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    cp .env.example .env
+    python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 
 ### Frontend
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+    cd frontend
+    npm install
+    npm run dev
 
 The app will be available at:
 
-```text
-http://localhost:5173
-```
+    http://localhost:5173
 
 ## Configuration
 
 LLM provider settings are configured via `.env`, which is not committed.
 
-```env
-DEEPSEEK_API_KEY=your_api_key_here
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
-EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
-```
+    DEEPSEEK_API_KEY=your_api_key_here
+    DEEPSEEK_BASE_URL=https://api.deepseek.com
+    DEEPSEEK_MODEL=deepseek-v4-flash
+    EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 
 If `DEEPSEEK_API_KEY` is left empty, the system will only return retrieved snippets and a brief local summary without LLM-generated answers.
 
