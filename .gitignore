@@ -1,0 +1,57 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+config/ai_settings.local.json
+*.key
+*.pem
+
+# Course materials / user data
+subjects/
+materials/
+outputs/
+chroma_db/
+data/
+
+# Logs and temp
+*.log
+*.tmp
+*.zip
+.DS_Store
+Thumbs.db
+
+# Local databases
+*.db
+*.sqlite
+
+# IDEs and tools
+.claude/
+.codex/
+.vscode/
+
+# Internal documentation (not for public distribution)
+AGENTS.md
+CLAUDE.md
+PROJECT_PROGRESS.md
+RAG_project_handoff*
+mojibake_diagnosis.txt
+mojibake_diagnosis.md
