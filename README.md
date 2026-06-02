@@ -29,8 +29,9 @@
 - Git
 - Python 3.10+
 - Node.js 18+
-- LibreOffice, optional, for `.ppt` to `.pptx` conversion
-- Internet access, first launch may download the embedding model
+- LibreOffice (optional, but recommended for `.ppt` / `.pptx` source preview and `.ppt` to `.pptx` conversion)
+- PDF, TXT, DOCX workflows can run without LibreOffice
+- Internet access may be required on first launch to download the embedding model
 
 ## Quick Start
 
@@ -62,14 +63,29 @@ The app will be available at:
 
     http://localhost:5173
 
+## First Run Workflow
+
+1. Start the backend server (see [Quick Start](#quick-start)).
+2. Start the frontend dev server (see [Quick Start](#quick-start)).
+3. Open http://localhost:5173 in your browser.
+4. Create a subject (course) in the web UI.
+5. Upload PDF, PPT, PPTX, DOCX, or TXT course materials.
+6. Build the vector index for the selected materials.
+7. Ask questions or generate overview, study guide, self-test questions, or long-form analysis.
+8. Use source citations and Source Preview to verify answers.
+
 ## Configuration
 
 LLM provider settings are configured via `.env`, which is not committed.
+
+`.env.example` is only a template. Copy it to `.env` and fill in your own API key if LLM-generated answers are needed:
 
     DEEPSEEK_API_KEY=your_api_key_here
     DEEPSEEK_BASE_URL=https://api.deepseek.com
     DEEPSEEK_MODEL=deepseek-v4-flash
     EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+
+**Do not commit `.env`.**
 
 If `DEEPSEEK_API_KEY` is left empty, the system will only return retrieved snippets and a brief local summary without LLM-generated answers.
 
