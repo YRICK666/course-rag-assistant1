@@ -20,6 +20,7 @@ import type {
   QARequest,
   QAResponse,
   RenameMaterialResponse,
+  SelfTestRequest,
   SnippetKeywordsRequest,
   SnippetKeywordsResponse,
   StudyGuideRequest,
@@ -252,6 +253,18 @@ export async function askQuestion(subject: string, payload: QARequest): Promise<
   });
 }
 
+export async function generateSelfTest(subject: string, payload: SelfTestRequest): Promise<QAResponse> {
+  const endpoint = `/api/subjects/${encodeURIComponent(subject)}/self-test`;
+  const url = `${API_BASE_URL}${endpoint}`;
+  return fetchJson<QAResponse>(url, endpoint, subject, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+}
+
 export async function fetchQaHistory(subject: string, limit = 50, offset = 0): Promise<QAHistoryListResponse> {
   const endpoint = `/api/qa-history?subject=${encodeURIComponent(subject)}&limit=${limit}&offset=${offset}`;
   const url = `${API_BASE_URL}${endpoint}`;
@@ -436,6 +449,57 @@ export async function exportDocumentDocx(payload: ExportDocumentRequest): Promis
   } catch (error) {
     console.error("POST /api/export/document/docx failed", error);
     throw new Error(`Word 导出失败：${errorMessage(error)}`);
+  }
+}
+
+
+export async function exportDocumentPdf(
+  payload: ExportDocumentRequest
+): Promise<void> {
+  const endpoint = "/api/export/document/pdf";
+  const url = `${API_BASE_URL}${endpoint}`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+
+      try {
+        const data = await response.json();
+        detail = data.detail || data.warning || detail;
+      } catch {
+        // Keep the HTTP status text when the body is not JSON.
+      }
+
+      throw new Error(detail);
+    }
+
+    const blob = await response.blob();
+    const downloadUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = downloadUrl;
+    link.download =
+      payload.filename ||
+      `${payload.filename_prefix || "export"}.pdf`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    window.setTimeout(() => {
+      URL.revokeObjectURL(downloadUrl);
+    }, 1000);
+  } catch (error) {
+    console.error("POST /api/export/document/pdf failed", error);
+    throw error;
   }
 }
 

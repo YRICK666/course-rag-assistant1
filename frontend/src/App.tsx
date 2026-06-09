@@ -9,6 +9,7 @@ import {
   deleteMaterial,
   deleteQaHistoryItem,
   exportDocumentDocx,
+  exportDocumentPdf,
   exportSelfTestDocx,
   fetchAiSettings,
   fetchLongformAnalysis,
@@ -19,6 +20,7 @@ import {
   fetchSubjectMaterials,
   fetchSubjects,
   fetchSubjectStatus,
+  generateSelfTest,
   renameMaterial,
   saveAiSettings,
   uploadMaterials
@@ -85,33 +87,6 @@ const answerModeOptions: { value: QuizAnswerMode; label: string; desc: string }[
   { value: "end", label: "题目集中在前，答案解析统一放卷尾", desc: "所有题目先出现，最后统一给出答案与解析" },
   { value: "dual", label: "生成练习版 + 解析版", desc: "练习版无答案，解析版含答案、解析、考点" },
 ];
-
-function buildSelfTestPrompt(settings: QuizSettings): string {
-  const enabledTypes = settings.typeConfigs.filter((tc) => tc.enabled);
-  const totalCount = enabledTypes.reduce((sum, tc) => sum + tc.count, 0);
-
-  let prompt = `请基于当前课程资料生成一组期末复习自测题。\n\n`;
-  prompt += `要求：\n\n1. 只根据已检索到的课程资料出题，不要编造资料外知识。\n\n`;
-  prompt += `2. 共生成 ${totalCount} 道题，按以下顺序和数量：\n`;
-  enabledTypes.forEach((tc) => {
-    prompt += `   * ${tc.count} 道${typeLabels[tc.type]}\n`;
-  });
-
-  prompt += `\n3. `;
-  if (settings.answerMode === "inline") {
-    prompt += `输出时使用固定大标题 \`## 解析版\`，每道题后立即给出【答案】【解析】【考点】。`;
-  } else if (settings.answerMode === "end") {
-    prompt += `输出时使用固定大标题 \`## 解析版\`。先完整输出所有题目，不要夹杂答案；\n   最后单独输出 \`## 答案与解析\` 区。`;
-  } else {
-    prompt += `输出固定分隔标题：\n   \`## 练习版\`\n   \`## 解析版\`\n   其中：\n   * 练习版只包含题目，不包含答案解析\n   * 解析版包含题目、答案、解析、考点`;
-  }
-
-  prompt += `\n\n4. 禁止生成不在上述列表中的题型。\n\n`;
-  prompt += `5. 难度以课堂复习和期末考试为准，不要过度拔高。\n\n`;
-  prompt += `6. 输出要清晰，不要使用 Markdown 表格。\n\n`;
-  prompt += `7. 请严格按照用户指定的题型顺序组织输出。`;
-  return prompt;
-}
 
 interface PrintPayload {
   title: string;
@@ -1059,12 +1034,12 @@ function App() {
   const [sourcesExpanded, setSourcesExpanded] = useState(false);
   const [overviewSourcesExpanded, setOverviewSourcesExpanded] = useState(false);
   const [studyGuideSourcesExpanded, setStudyGuideSourcesExpanded] = useState(false);
-  const evidenceCardRefs = useRef<Record<number, HTMLArticleElement | null>>({});
+  const evidenceCardRefs = useRef<Record<number, HTMLElement | null>>({});
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const originalTitleRef = useRef(document.title);
   const [highlightedEvidenceIndex, setHighlightedEvidenceIndex] = useState<number | null>(null);
-  const overviewCardRefs = useRef<Record<number, HTMLDivElement | null>>({});
-  const studyGuideCardRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const overviewCardRefs = useRef<Record<number, HTMLElement | null>>({});
+  const studyGuideCardRefs = useRef<Record<number, HTMLElement | null>>({});
   const [highlightedOverviewIndex, setHighlightedOverviewIndex] = useState<number | null>(null);
   const [highlightedStudyGuideIndex, setHighlightedStudyGuideIndex] = useState<number | null>(null);
   const [highlightedSelfTestSourceIndex, setHighlightedSelfTestSourceIndex] = useState<number | null>(null);
@@ -1123,10 +1098,38 @@ function App() {
   const [overviewIncludeSources, setOverviewIncludeSources] = useState(false);
   const [studyGuideIncludeSources, setStudyGuideIncludeSources] = useState(false);
   const [printPayload, setPrintPayload] = useState<PrintPayload | null>(null);
-  const isSelfTestRequestRef = useRef(false);
   const selfTestSourceRefs = useRef<Record<number, HTMLElement | null>>({});
   const [longformSettingsOpen, setLongformSettingsOpen] = useState(false);
   const [longformLoading, setLongformLoading] = useState(false);
+  const [longformLoadingStage, setLongformLoadingStage] = useState(0);
+
+  useEffect(() => {
+    if (!longformLoading) {
+      setLongformLoadingStage(0);
+      return;
+    }
+
+    setLongformLoadingStage(0);
+
+    const timers = [
+      window.setTimeout(() => setLongformLoadingStage(1), 4000),
+      window.setTimeout(() => setLongformLoadingStage(2), 10000),
+      window.setTimeout(() => setLongformLoadingStage(3), 20000),
+      window.setTimeout(() => setLongformLoadingStage(4), 35000),
+    ];
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [longformLoading]);
+
+  const longformLoadingText = [
+    "正在收集资料内容",
+    "正在分组整理知识点",
+    "正在生成文章结构",
+    "正在综合生成长文",
+    "资料较多，仍在处理中，请稍候",
+  ][longformLoadingStage] ?? "正在整理资料";
   const [longformError, setLongformError] = useState("");
   const [longformResult, setLongformResult] = useState<LongformResponse | null>(null);
   const [longformType, setLongformType] = useState<LongformType>("analysis");
@@ -2440,18 +2443,22 @@ function App() {
     });
   };
 
-  const handleAsk = async (event: FormEvent<HTMLFormElement>) => {
+  const handleAsk = async (
+    event: FormEvent<HTMLFormElement>
+  ) => {
     event.preventDefault();
+
     const trimmed = question.trim();
+
     if (!trimmed || !selectedSubject || qaLoading) {
       return;
     }
 
-    const wasSelfTest = isSelfTestRequestRef.current;
-    isSelfTestRequestRef.current = false;
+    const userMessage: ChatMessage = {
+      role: "user",
+      content: trimmed
+    };
 
-    const displayQuestion = wasSelfTest ? "请基于当前资料生成自测题" : trimmed;
-    const userMessage: ChatMessage = { role: "user", content: displayQuestion };
     setMessages([userMessage]);
     setQuestion("");
     setQaLoading(true);
@@ -2465,55 +2472,58 @@ function App() {
     try {
       const response = await askQuestion(selectedSubject, {
         question: trimmed,
-        source_filters: selectedMaterials.map((material) => material.relativePath),
+        source_filters: selectedMaterials.map(
+          (material) => material.relativePath
+        ),
         top_k: 8,
         use_deepseek: true
       });
-      const answerText = response.answer || response.warning || "后端没有返回答案。";
-      if (wasSelfTest) {
-        setMessages([
-          userMessage,
-          { role: "assistant", content: "已生成自测题，见下方结果区。" }
-        ]);
-      } else {
-        setMessages([
-          userMessage,
-          { role: "assistant", content: answerText }
-        ]);
-      }
-      const hits = response.hits || [];
-      setQaHits(hits);
-      setQaWarning(response.warning || "");
-      setQaErrorType(response.error_type);
-      setApiNotice(response.warning ? `问答提示：${response.warning}` : "");
 
-      if (wasSelfTest && answerText) {
-        const scopeLabel = formatSourceScope(selectedMaterials.map((m) => m.relativePath));
-        setSelfTestResult({
-          subject: selectedSubject,
-          scopeLabel,
-          sourceFilters: selectedMaterials.map((m) => m.relativePath),
-          generatedAt: new Date().toISOString(),
-          content: answerText,
-          hits,
-          quizSettings: { ...quizSettings }
-        });
-        setActiveQuizTab("practice");
-      }
-    } catch (error) {
-      console.error("POST /qa failed", error);
+      const answerText =
+        response.answer ||
+        response.warning ||
+        "后端没有返回答案。";
+
       setMessages([
         userMessage,
         {
           role: "assistant",
-          content: `问答接口调用失败：${errorMessage(error)}\n\n请确认后端已启动、当前科目已建库，并稍后重试。`
+          content: answerText
         }
       ]);
+
+      const hits = response.hits || [];
+
+      setQaHits(hits);
+      setQaWarning(response.warning || "");
+      setQaErrorType(response.error_type);
+      setApiNotice(
+        response.warning
+          ? `问答提示：${response.warning}`
+          : ""
+      );
+    } catch (error) {
+      console.error("POST /qa failed", error);
+
+      setMessages([
+        userMessage,
+        {
+          role: "assistant",
+          content:
+            `问答接口调用失败：${errorMessage(error)}\n\n` +
+            "请确认后端已启动、当前科目已建库，并稍后重试。"
+        }
+      ]);
+
       setQaHits([]);
       setQaWarning("问答接口调用失败，请稍后重试。");
       setQaErrorType(undefined);
       setExpandedEvidenceKeys({});
-      setApiNotice(`POST /api/subjects/${encodeURIComponent(selectedSubject)}/qa 失败：${errorMessage(error)}`);
+      setApiNotice(
+        `POST /api/subjects/${encodeURIComponent(
+          selectedSubject
+        )}/qa 失败：${errorMessage(error)}`
+      );
     } finally {
       setQaLoading(false);
     }
@@ -2536,14 +2546,122 @@ function App() {
     setShowAnswer(false);
   };
 
-  const handleStartQuiz = () => {
-    const enabledCount = quizSettings.typeConfigs.filter((tc) => tc.enabled).length;
-    if (enabledCount === 0) return;
-    const prompt = buildSelfTestPrompt(quizSettings);
-    isSelfTestRequestRef.current = true;
-    setQuestion(prompt);
+  const handleStartQuiz = async () => {
+    if (!selectedSubject || qaLoading) {
+      return;
+    }
+
+    const enabledConfigs = quizSettings.typeConfigs.filter(
+      (config) => config.enabled && config.count > 0
+    );
+
+    if (enabledConfigs.length === 0) {
+      return;
+    }
+
+    const sourceFilters = selectedMaterials.map(
+      (material) => material.relativePath
+    );
+
+    const userMessage: ChatMessage = {
+      role: "user",
+      content: "请基于当前资料生成自测题"
+    };
+
     setShowQuizModal(false);
-    requestAnimationFrame(() => qaInputRef.current?.focus());
+    setShowAnswer(false);
+    setSelfTestResult(null);
+    setQaHits([]);
+    setMessages([userMessage]);
+    setQuestion("");
+    setQaLoading(true);
+    setQaWarning("");
+    setQaErrorType(undefined);
+    setExpandedEvidenceKeys({});
+    setSourcesExpanded(false);
+    setPreviewNotice("");
+    closeSourcePreview();
+
+    try {
+      const response = await generateSelfTest(selectedSubject, {
+        source_filters: sourceFilters,
+        type_configs: enabledConfigs.map((config) => ({
+          type: config.type,
+          count: config.count
+        })),
+        answer_mode: quizSettings.answerMode
+      });
+
+      if (response.error_type || !response.answer) {
+        throw new Error(
+          response.warning ||
+          (response.error_type
+            ? `自测题生成失败：${response.error_type}`
+            : "后端没有返回自测题。")
+        );
+      }
+
+      const answerText =
+        response.answer ||
+        response.warning ||
+        "后端没有返回自测题。";
+
+      const hits = response.hits || [];
+
+      setMessages([
+        userMessage,
+        {
+          role: "assistant",
+          content: "已生成自测题，见下方结果区。"
+        }
+      ]);
+
+      setQaHits(hits);
+      setQaWarning(response.warning || "");
+      setQaErrorType(response.error_type);
+      setApiNotice(
+        response.warning
+          ? `自测题提示：${response.warning}`
+          : ""
+      );
+
+      setSelfTestResult({
+        subject: selectedSubject,
+        scopeLabel: formatSourceScope(sourceFilters),
+        sourceFilters,
+        generatedAt: new Date().toISOString(),
+        content: answerText,
+        hits,
+        quizSettings: { ...quizSettings }
+      });
+
+      setActiveQuizTab("practice");
+    } catch (error) {
+      console.error("POST /self-test failed", error);
+
+      setMessages([
+        userMessage,
+        {
+          role: "assistant",
+          content:
+            `自测题接口调用失败：${errorMessage(error)}\n\n` +
+            "请确认后端已启动、当前科目已建库，并稍后重试。"
+        }
+      ]);
+
+      setQaHits([]);
+      setSelfTestResult(null);
+      setQaWarning("自测题接口调用失败，请稍后重试。");
+      setQaErrorType(undefined);
+      setExpandedEvidenceKeys({});
+      setApiNotice(
+        `POST /api/subjects/${encodeURIComponent(
+          selectedSubject
+        )}/self-test 失败：${errorMessage(error)}`
+      );
+    } finally {
+      setQaLoading(false);
+    }
   };
 
   const handleCancelQuiz = () => {
@@ -2669,25 +2787,44 @@ function App() {
     window.print();
   };
 
-  const handleSelfTestPrint = () => {
+  const handleSelfTestPrint = async () => {
     if (!selfTestResult) return;
+
     const content = getQuizDisplayContent();
-    setPrintPayload({
-      title: "自测题",
+    const filename = buildExportFilename({
       subject: selfTestResult.subject,
+      exportType: "自测题",
       scopeLabel: selfTestResult.scopeLabel,
       generatedAt: selfTestResult.generatedAt,
-      content: selfTestIncludeSources ? content : stripCitationMarks(content),
-      sources: selfTestResult.hits,
-      includeSources: selfTestIncludeSources,
-      filename: buildExportFilename({
-        subject: selfTestResult.subject,
-        exportType: "自测题",
-        scopeLabel: selfTestResult.scopeLabel,
-        generatedAt: selfTestResult.generatedAt,
-        extension: ".pdf",
-      }),
+      extension: ".pdf",
     });
+
+    try {
+      const exportContent = selfTestIncludeSources
+        ? content
+        : stripCitationMarks(content);
+      const citations = selfTestIncludeSources
+        ? extractCitationNumbers(content)
+        : undefined;
+
+      await exportDocumentPdf({
+        title: "自测题",
+        subject: selfTestResult.subject,
+        scope_label: selfTestResult.scopeLabel,
+        generated_at: selfTestResult.generatedAt,
+        content:
+          exportContent +
+          (citations
+            ? buildSourcesText(selfTestResult.hits, citations)
+            : ""),
+        sources: selfTestResult.hits,
+        include_sources: selfTestIncludeSources,
+        filename_prefix: filename,
+        filename,
+      });
+    } catch (error) {
+      setApiNotice(`PDF 导出失败：${errorMessage(error)}`);
+    }
   };
 
   const handleLongformAnalysis = async () => {
@@ -2716,6 +2853,10 @@ function App() {
     try {
       const response = await fetchLongformAnalysis(selectedSubject, payload);
       setLongformResult(response);
+
+      if (historyOpen) {
+        void loadHistory();
+      }
     } catch (error) {
       console.error("POST /longform failed", error);
       setLongformError(`资料整理接口调用失败：${errorMessage(error)}`);
@@ -2758,8 +2899,9 @@ function App() {
     }
   };
 
-  const handleLongformPrintPdf = () => {
+  const handleLongformPrintPdf = async () => {
     if (!longformResult) return;
+
     const typeLabels: Record<string, string> = {
       analysis: "深度分析",
       study_notes: "学习笔记",
@@ -2768,22 +2910,33 @@ function App() {
       outline: "知识框架",
     };
     const exportType = typeLabels[longformType] || "资料整理";
-    setPrintPayload({
-      title: exportType,
+    const scopeLabel = formatSourceScope(
+      selectedMaterials.map((material) => material.relativePath)
+    );
+    const generatedAt = new Date().toISOString();
+    const filename = buildExportFilename({
       subject: selectedSubject,
-      scopeLabel: formatSourceScope(selectedMaterials.map((m) => m.relativePath)),
-      generatedAt: new Date().toISOString(),
-      content: longformResult.content,
-      sources: longformResult.sources,
-      includeSources: longformIncludeSources,
-      filename: buildExportFilename({
-        subject: selectedSubject,
-        exportType,
-        scopeLabel: formatSourceScope(selectedMaterials.map((m) => m.relativePath)),
-        generatedAt: new Date(),
-        extension: ".pdf",
-      }),
+      exportType,
+      scopeLabel,
+      generatedAt,
+      extension: ".pdf",
     });
+
+    try {
+      await exportDocumentPdf({
+        title: exportType,
+        subject: selectedSubject,
+        scope_label: scopeLabel,
+        generated_at: generatedAt,
+        content: longformResult.content,
+        sources: longformResult.sources,
+        include_sources: longformIncludeSources,
+        filename_prefix: filename,
+        filename,
+      });
+    } catch (error) {
+      setApiNotice(`PDF 导出失败：${errorMessage(error)}`);
+    }
   };
 
   const handleDocumentWord = async (payload: {
@@ -2815,11 +2968,35 @@ function App() {
     }
   };
 
-  const handleDocumentPrint = (payload: PrintPayload) => {
-    setPrintPayload({
-      ...payload,
-      content: payload.includeSources ? payload.content : stripCitationMarks(payload.content),
-    });
+  const handleDocumentPrint = async (
+    payload: PrintPayload
+  ) => {
+    try {
+      const exportContent = payload.includeSources
+        ? payload.content
+        : stripCitationMarks(payload.content);
+      const citations = payload.includeSources
+        ? extractCitationNumbers(payload.content)
+        : undefined;
+
+      await exportDocumentPdf({
+        title: payload.title,
+        subject: payload.subject,
+        scope_label: payload.scopeLabel,
+        generated_at: payload.generatedAt,
+        content:
+          exportContent +
+          (citations
+            ? buildSourcesText(payload.sources, citations)
+            : ""),
+        sources: payload.sources,
+        include_sources: payload.includeSources,
+        filename_prefix: payload.filename,
+        filename: payload.filename,
+      });
+    } catch (error) {
+      setApiNotice(`PDF 导出失败：${errorMessage(error)}`);
+    }
   };
 
   const getExportFilename = (exportType: string, extension: string) => {
@@ -3649,7 +3826,7 @@ function App() {
               {historyLoading && <div className="qa-history-loading">加载中…</div>}
               {historyError && <div className="qa-history-error">{historyError}</div>}
               {!historyLoading && !historyError && historyItems.length === 0 && (
-                <div className="qa-history-empty">当前科目暂无问答历史。</div>
+                <div className="qa-history-empty">当前科目暂无历史记录。</div>
               )}
               {!historyLoading && !historyError && historyItems.length > 0 && (
                 <div className="qa-history-list">
@@ -3698,7 +3875,11 @@ function App() {
                               </ul>
                             </div>
                           )}
-                          <div className="qa-history-answer">{item.answer}</div>
+                          <div className="qa-history-answer">
+                            {item.answer_mode === "资料整理"
+                              ? renderRichMarkdown(item.answer, 0, () => {})
+                              : item.answer}
+                          </div>
                           {item.hits && item.hits.length > 0 ? (
                             <details className="qa-history-sources-details">
                               <summary className="qa-history-sources-summary">
@@ -3787,9 +3968,22 @@ function App() {
               </div>
             ))}
             {qaLoading && (
-              <div className="qa-loading-state" aria-live="polite">
-                <span aria-hidden="true" />
-                {qaLoadingText}
+              <div
+                className="assistant-thinking"
+                aria-live="polite"
+                aria-label={qaLoadingText}
+              >
+                <span className="assistant-thinking-text">
+                  {qaLoadingText}
+                </span>
+                <span
+                  className="assistant-thinking-dots"
+                  aria-hidden="true"
+                >
+                  <i />
+                  <i />
+                  <i />
+                </span>
               </div>
             )}
             {previewNotice && <div className="source-preview-notice">{previewNotice}</div>}
@@ -3943,7 +4137,7 @@ function App() {
                   filename: getExportFilename("智能问答", ".pdf"),
                 });
               }}>
-                打印 / 另存为 PDF
+                导出 PDF
               </button>
             </div>
           )}
@@ -4059,7 +4253,7 @@ function App() {
                   导出 Word
                 </button>
                 <button type="button" onClick={handleSelfTestPrint} className="self-test-print-pdf">
-                  打印 / 另存为 PDF
+                  导出 PDF
                 </button>
               </div>
             </section>
@@ -4184,7 +4378,7 @@ function App() {
                   导出 Word
                 </button>
                 <button type="button" onClick={handleLongformPrintPdf} className="longform-print-pdf">
-                  打印 / 另存为 PDF
+                  导出 PDF
                 </button>
               </div>
             </section>
@@ -4555,7 +4749,23 @@ function App() {
       )}
       {longformLoading && !longformSettingsOpen && (
         <div className="longform-loading-bar">
-          <span>正在整理资料…</span>
+          <div
+            className="assistant-thinking"
+            aria-live="polite"
+            aria-label={longformLoadingText}
+          >
+            <span className="assistant-thinking-text">
+              {longformLoadingText}
+            </span>
+            <span
+              className="assistant-thinking-dots"
+              aria-hidden="true"
+            >
+              <i />
+              <i />
+              <i />
+            </span>
+          </div>
         </div>
       )}
       {printPayload && (

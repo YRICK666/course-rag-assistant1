@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import os
 import json
 import re
@@ -71,23 +73,93 @@ def get_chat_completions_url() -> str:
     return f"{base_url}/chat/completions"
 
 
-def post_chat_completions(payload: dict[str, Any], *, timeout: int) -> dict[str, Any]:
+def post_chat_completions(
+    payload: dict[str, Any],
+    *,
+    timeout: int,
+) -> dict[str, Any]:
+    """Send chat completions with bounded retries for transient failures."""
     ensure_ai_enabled()
     api_key = get_deepseek_api_key()
     provider_label = get_llm_provider_label()
+
     if not api_key:
-        raise DeepSeekError(f"{provider_label} API key is not configured.")
+        raise DeepSeekError(
+            f"{provider_label} API key is not configured."
+        )
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    try:
-        response = requests.post(get_chat_completions_url(), headers=headers, json=payload, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        raise DeepSeekError(f"{provider_label} request failed: {exc}") from exc
+    url = get_chat_completions_url()
+    max_attempts = 3
+    retry_statuses = {429, 500, 502, 503, 504}
+    last_error: requests.RequestException | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+
+            if (
+                response.status_code in retry_statuses
+                and attempt < max_attempts
+            ):
+                time.sleep(min(2.0, 0.7 * attempt))
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            last_error = exc
+
+            if attempt < max_attempts:
+                time.sleep(min(2.0, 0.7 * attempt))
+                continue
+
+            raise DeepSeekError(
+                f"{provider_label} request failed after "
+                f"{max_attempts} attempts: {exc}"
+            ) from exc
+
+        except requests.HTTPError as exc:
+            last_error = exc
+            status_code = (
+                exc.response.status_code
+                if exc.response is not None
+                else None
+            )
+
+            if (
+                status_code in retry_statuses
+                and attempt < max_attempts
+            ):
+                time.sleep(min(2.0, 0.7 * attempt))
+                continue
+
+            raise DeepSeekError(
+                f"{provider_label} request failed: {exc}"
+            ) from exc
+
+        except requests.RequestException as exc:
+            raise DeepSeekError(
+                f"{provider_label} request failed: {exc}"
+            ) from exc
+
+    raise DeepSeekError(
+        f"{provider_label} request failed after "
+        f"{max_attempts} attempts: {last_error}"
+    )
 
 
 def ensure_ai_enabled() -> None:

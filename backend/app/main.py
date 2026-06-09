@@ -53,6 +53,7 @@ from services.material_service import (  # noqa: E402
 from services.qa_service import ask_course_question  # noqa: E402
 from services.scope_service import indexed_source_path_set  # noqa: E402
 from .services.longform_service import generate_longform_analysis  # noqa: E402
+from .services.self_test_service import generate_self_test  # noqa: E402
 from subject_store import SUBJECTS_DIR, create_subject, get_subject_paths, list_subjects  # noqa: E402
 from .db import init_db  # noqa: E402
 from .qa_history import (  # noqa: E402
@@ -97,13 +98,24 @@ class QaRequest(BaseModel):
     use_deepseek: bool = True
 
 
+class SelfTestTypeConfig(BaseModel):
+    type: Literal["choice", "fill", "essay"]
+    count: int = Field(default=0, ge=0, le=20)
+
+
+class SelfTestRequest(BaseModel):
+    source_filters: list[str] = Field(default_factory=list)
+    type_configs: list[SelfTestTypeConfig] = Field(default_factory=list)
+    answer_mode: Literal["inline", "end", "dual"] = "inline"
+
+
 class LongformRequest(BaseModel):
     source_filters: list[str] = Field(default_factory=list)
-    longform_type: str = "analysis"
+    longform_type: Literal["analysis", "study_notes", "report", "review", "outline"] = "analysis"
     target_length: int = Field(default=3000, ge=500, le=15000)
     include_sources: bool = True
-    strategy: str = "staged"
-    user_instruction: str = Field(default="", max_length=500)
+    strategy: Literal["staged"] = "staged"
+    user_instruction: str = Field(default="", max_length=1000)
 
 
 class SnippetKeywordsRequest(BaseModel):
@@ -1027,6 +1039,69 @@ def subject_qa(subject: str, request: QaRequest) -> dict:
     }
 
 
+@app.post("/api/subjects/{subject}/self-test")
+def subject_self_test(subject: str, request: SelfTestRequest) -> dict:
+    type_configs = [
+        config.dict()
+        for config in request.type_configs
+        if config.count > 0
+    ]
+    total_count = sum(int(config["count"]) for config in type_configs)
+    if not type_configs:
+        raise HTTPException(status_code=400, detail="至少需要选择一种题型。")
+    if total_count > 30:
+        raise HTTPException(status_code=400, detail="自测题总题量最多 30 题。")
+
+    try:
+        subject_paths = resolve_existing_subject_paths(subject)
+        _, index_status, warning = index_health(subject_paths)
+        if index_status == "corrupted":
+            return qa_error_response(warning or corrupted_index_warning())
+        if index_status == "empty":
+            return qa_error_response("当前科目还没有可用知识库，请先建立知识库。")
+
+        result = generate_self_test(
+            subject_paths,
+            source_filters=request.source_filters or None,
+            type_configs=type_configs,
+            answer_mode=request.answer_mode,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Self-test generation failed")
+        return qa_error_response(str(exc))
+
+    if not result.get("success"):
+        return qa_error_response(str(result.get("error") or "自测题生成未成功，请稍后重试。"))
+
+    answer_text = result.get("answer") or ""
+    hits = [api_hit(hit) for hit in result.get("hits", [])]
+
+    try:
+        create_qa_record(
+            subject=subject,
+            question="生成自测题",
+            answer=answer_text,
+            hits_count=len(hits),
+            answer_mode="自测题",
+            source_filters=request.source_filters,
+            warning=result.get("warning"),
+            rewritten_query="",
+            hits=hits,
+        )
+    except Exception:
+        pass
+
+    return {
+        "answer": answer_text,
+        "warning": result.get("warning"),
+        "hits": hits,
+    }
+
+
 def snippet_keywords_response(request: SnippetKeywordsRequest) -> dict:
     text = request.text.strip()
     if not text:
@@ -1170,6 +1245,115 @@ def _build_docx_response(
     )
 
 
+
+def _build_pdf_response(
+    title: str,
+    subject: str,
+    scope_label: str,
+    generated_at: str,
+    content: str,
+    sources: list[dict],
+    include_sources: bool,
+    filename_prefix: str,
+) -> Response:
+    # Build a DOCX in memory, convert it to PDF, and return a download.
+    executable = find_libreoffice_executable()
+    if not executable:
+        raise HTTPException(
+            status_code=500,
+            detail="无法导出 PDF：未检测到 LibreOffice。",
+        )
+
+    requested_name = Path(filename_prefix or "export.pdf").name
+    if not requested_name.lower().endswith(".pdf"):
+        requested_name = f"{Path(requested_name).stem}.pdf"
+
+    docx_response = _build_docx_response(
+        title=title,
+        subject=subject,
+        scope_label=scope_label,
+        generated_at=generated_at,
+        content=content,
+        sources=sources,
+        include_sources=include_sources,
+        filename_prefix="source.docx",
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            input_docx = temp_root / "source.docx"
+            output_dir = temp_root / "converted"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            input_docx.write_bytes(bytes(docx_response.body))
+
+            command = [
+                executable,
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(output_dir),
+                str(input_docx),
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+
+            if result.returncode != 0:
+                logger.error(
+                    "LibreOffice PDF export failed: stdout=%s stderr=%s",
+                    result.stdout,
+                    result.stderr,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="PDF 导出失败，请确认 LibreOffice 可正常运行。",
+                )
+
+            generated_pdf = output_dir / "source.pdf"
+            if not generated_pdf.exists():
+                candidates = list(output_dir.glob("*.pdf"))
+                if not candidates:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="PDF 导出失败，未生成 PDF 文件。",
+                    )
+                generated_pdf = candidates[0]
+
+            pdf_bytes = generated_pdf.read_bytes()
+
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF 导出超时，请稍后重试。",
+        ) from exc
+    except Exception as exc:
+        logger.exception("PDF export failed")
+        raise HTTPException(
+            status_code=500,
+            detail="PDF 导出失败，请检查后端日志。",
+        ) from exc
+
+    encoded_filename = quote(requested_name, safe=".")
+    headers = {
+        "Content-Disposition": (
+            f"attachment; filename*=UTF-8''{encoded_filename}"
+        )
+    }
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers=headers,
+    )
+
+
 @app.post("/api/export/self-test/docx")
 def export_self_test_docx(request: ExportSelfTestRequest) -> Response:
     return _build_docx_response(
@@ -1195,6 +1379,25 @@ def export_document_docx(request: DocxExportRequest) -> Response:
         sources=request.sources,
         include_sources=request.include_sources,
         filename_prefix=request.filename or request.filename_prefix,
+    )
+
+
+
+@app.post("/api/export/document/pdf")
+def export_document_pdf(request: DocxExportRequest) -> Response:
+    return _build_pdf_response(
+        title=request.title,
+        subject=request.subject,
+        scope_label=request.scope_label,
+        generated_at=request.generated_at,
+        content=request.content,
+        sources=request.sources,
+        include_sources=request.include_sources,
+        filename_prefix=(
+            request.filename
+            or request.filename_prefix
+            or "export.pdf"
+        ),
     )
 
 
@@ -1354,6 +1557,53 @@ def subject_longform(subject: str, request: LongformRequest) -> dict:
             "warnings": [f"Longform 生成失败：{exc}"],
             "stats": {"total_chunks": 0, "used_chunks": 0, "groups_count": 0},
         }
+
+    content = str(result.get("content") or "").strip()
+
+    if content:
+        type_labels = {
+            "analysis": "深度分析",
+            "study_notes": "学习笔记",
+            "report": "综合报告",
+            "review": "读后感 / 心得体会",
+            "outline": "提纲",
+        }
+        type_label = type_labels.get(
+            request.longform_type,
+            request.longform_type or "资料整理",
+        )
+
+        raw_sources = result.get("sources") or []
+        history_sources = (
+            [item for item in raw_sources if isinstance(item, dict)]
+            if isinstance(raw_sources, list)
+            else []
+        )
+
+        raw_warnings = result.get("warnings") or []
+        history_warning = (
+            "；".join(str(item) for item in raw_warnings if item)
+            if isinstance(raw_warnings, list)
+            else str(raw_warnings or "")
+        )
+
+        try:
+            create_qa_record(
+                subject=subject,
+                question=f"资料整理｜{type_label}",
+                answer=content,
+                hits_count=len(history_sources),
+                answer_mode="资料整理",
+                source_filters=request.source_filters,
+                warning=history_warning,
+                rewritten_query=request.user_instruction or "",
+                hits=history_sources,
+            )
+        except Exception:
+            logger.exception(
+                "Longform 已生成，但保存历史记录失败：subject=%s",
+                subject,
+            )
 
     return result
 

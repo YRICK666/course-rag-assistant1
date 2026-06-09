@@ -95,6 +95,12 @@ export interface QAResponse {
   error_type?: string;
 }
 
+export interface SelfTestRequest {
+  source_filters: string[];
+  type_configs: Array<Pick<QuizTypeConfig, "type" | "count">>;
+  answer_mode: QuizAnswerMode;
+}
+
 export interface SnippetKeywordsRequest {
   text: string;
 }
