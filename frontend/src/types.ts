@@ -99,6 +99,7 @@ export interface SelfTestRequest {
   source_filters: string[];
   type_configs: Array<Pick<QuizTypeConfig, "type" | "count">>;
   answer_mode: QuizAnswerMode;
+  generation_mode: QuizGenerationMode;
 }
 
 export interface SnippetKeywordsRequest {
@@ -213,6 +214,7 @@ export interface ConvertPptResponse {
 
 export type QuizQuestionType = "choice" | "fill" | "essay";
 export type QuizAnswerMode = "inline" | "end" | "dual";
+export type QuizGenerationMode = "single_page" | "fusion";
 
 export interface QuizTypeConfig {
   type: QuizQuestionType;
@@ -223,6 +225,7 @@ export interface QuizTypeConfig {
 export interface QuizSettings {
   typeConfigs: QuizTypeConfig[];
   answerMode: QuizAnswerMode;
+  generationMode: QuizGenerationMode;
 }
 
 export interface SelfTestResult {

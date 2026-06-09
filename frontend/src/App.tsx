@@ -44,6 +44,7 @@ import type {
   OverviewSource,
   QAHistoryItem,
   QuizAnswerMode,
+  QuizGenerationMode,
   QuizQuestionType,
   QuizSettings,
   QuizTypeConfig,
@@ -86,6 +87,23 @@ const answerModeOptions: { value: QuizAnswerMode; label: string; desc: string }[
   { value: "inline", label: "每题后显示答案解析", desc: "题目1 → 答案解析 → 题目2 → 答案解析" },
   { value: "end", label: "题目集中在前，答案解析统一放卷尾", desc: "所有题目先出现，最后统一给出答案与解析" },
   { value: "dual", label: "生成练习版 + 解析版", desc: "练习版无答案，解析版含答案、解析、考点" },
+];
+
+const generationModeOptions: {
+  value: QuizGenerationMode;
+  label: string;
+  desc: string;
+}[] = [
+  {
+    value: "single_page",
+    label: "单页出题",
+    desc: "每道题主要依据一页 PPT 或 PDF，同页多个片段会合并使用"
+  },
+  {
+    value: "fusion",
+    label: "融合出题",
+    desc: "综合 2～3 个存在明确关联的页面生成综合题"
+  }
 ];
 
 interface PrintPayload {
@@ -803,7 +821,7 @@ function renderInlineAssistant(
   onSourceClick: (num: number) => void
 ) {
   const segments: Array<string | JSX.Element> = [];
-  const pattern = /(\*\*[^*]+\*\*)|\[(\d+)\]|【(\d+)】/g;
+  const pattern = /(\*\*[^*]+\*\*)|\[(\d+)\]|【(\d+)】|(?:\[|【)?\bE(\d+)\b(?:\]|】)?/gi;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -816,7 +834,8 @@ function renderInlineAssistant(
       // Bold **text**
       segments.push(<strong key={`s${segments.length}`}>{match[1].slice(2, -2)}</strong>);
     } else {
-      const num = parseInt(match[2] ?? match[3], 10);
+      const evidenceMatch = Boolean(match[4]);
+      const num = parseInt(match[2] ?? match[3] ?? match[4], 10);
       if (num >= 1 && num <= maxSourceNum) {
         segments.push(
           <button
@@ -825,7 +844,7 @@ function renderInlineAssistant(
             type="button"
             onClick={() => onSourceClick(num)}
           >
-            [{num}]
+            {evidenceMatch ? `E${num}` : `[${num}]`}
           </button>
         );
       } else {
@@ -1086,7 +1105,8 @@ function App() {
       { type: "fill", enabled: true, count: 3 },
       { type: "essay", enabled: true, count: 2 },
     ],
-    answerMode: "dual"
+    answerMode: "dual",
+    generationMode: "single_page"
   });
   const [activeQuizTab, setActiveQuizTab] = useState<"practice" | "answer">("practice");
   const [showAnswer, setShowAnswer] = useState(false);
@@ -2589,7 +2609,8 @@ function App() {
           type: config.type,
           count: config.count
         })),
-        answer_mode: quizSettings.answerMode
+        answer_mode: quizSettings.answerMode,
+        generation_mode: quizSettings.generationMode
       });
 
       if (response.error_type || !response.answer) {
@@ -2731,15 +2752,42 @@ function App() {
 
   const handleSelfTestSourceClick = (sourceNumber: number) => {
     if (!selfTestResult) return;
+
     const targetIndex = sourceNumber - 1;
     if (targetIndex < 0 || targetIndex >= selfTestResult.hits.length) return;
-    selfTestSourceRefs.current[targetIndex]?.scrollIntoView({ behavior: "smooth", block: "center" });
+
+    const hit = selfTestResult.hits[targetIndex];
+    const target = hitToPreviewTarget(hit);
+
     setHighlightedSelfTestSourceIndex(targetIndex);
-    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+
+    if (highlightTimerRef.current) {
+      clearTimeout(highlightTimerRef.current);
+    }
+
     highlightTimerRef.current = setTimeout(() => {
       setHighlightedSelfTestSourceIndex(null);
       highlightTimerRef.current = null;
     }, 1500);
+
+    if (target) {
+      handleReferencePreviewClick(
+        target,
+        "\u81ea\u6d4b\u9898\u6765\u6e90",
+        [target],
+        0
+      );
+      return;
+    }
+
+    setSelfTestSourcesExpanded(true);
+
+    requestAnimationFrame(() => {
+      selfTestSourceRefs.current[targetIndex]?.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+      });
+    });
   };
 
   const getQuizDisplayContent = (): string => {
@@ -4529,6 +4577,26 @@ function App() {
                     ? "请至少选择一种题型"
                     : `共 ${quizSettings.typeConfigs.filter((tc) => tc.enabled).reduce((s, tc) => s + tc.count, 0)} 题`}
                 </p>
+              </div>
+              <div className="quiz-modal-section">
+                <h3>出题方式</h3>
+                <div className="quiz-answer-modes">
+                  {generationModeOptions.map((opt) => (
+                    <label key={opt.value} className={`quiz-answer-card${quizSettings.generationMode === opt.value ? " quiz-answer-card-active" : ""}`}>
+                      <input
+                        type="radio"
+                        name="generationMode"
+                        value={opt.value}
+                        checked={quizSettings.generationMode === opt.value}
+                        onChange={() => setQuizSettings((prev) => ({ ...prev, generationMode: opt.value }))}
+                      />
+                      <div className="quiz-answer-card-content">
+                        <strong>{opt.label}</strong>
+                        <span>{opt.desc}</span>
+                      </div>
+                    </label>
+                  ))}
+                </div>
               </div>
               <div className="quiz-modal-section">
                 <h3>答案与解析排版</h3>

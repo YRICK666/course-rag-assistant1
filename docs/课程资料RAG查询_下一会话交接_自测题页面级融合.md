@@ -1,580 +1,277 @@
-# 课程资料 RAG 查询项目——下一会话交接文档
+# 课程资料 RAG 查询 — 下一会话交接文档
 
-> 主题：继续优化自测题生成，重点实现“默认单页出题 / 可选融合出题”。
+## 状态：已实现
 
-## 一、项目基本信息
+本文档记录自测题页面级组卷（single_page）、页面融合出题（fusion）、E 编号来源预览、以及 PDF 导出的功能实现状态。
 
-项目路径：
+---
+
+## 一、项目位置
 
 ```text
 G:\AI-Workstation\课程资料RAG查询
 ```
 
-主要结构：
+前置文档（每次新会话必须先读）：
 
-- 后端：FastAPI
-- 前端：React + Vite + TypeScript
-- 向量库：ChromaDB
-- 嵌入模型：`bge-small-zh-v1.5`
-- AI：DeepSeek / OpenAI-compatible Chat Completions
-- 后端入口：`backend/app/main.py`
-- 前端主页面：`frontend/src/App.tsx`
-- 前端 API：`frontend/src/api.ts`
-- 前端类型：`frontend/src/types.ts`
-- 普通问答服务：`src/services/qa_service.py`
-- 自测题服务：`backend/app/services/self_test_service.py`
-- 公共模型请求：`src/llm_deepseek.py`
+- `AGENTS.md` — AI 工作规则（权威）
+- `CLAUDE.md` — 项目层级规则
+- `docs/SELF_TEST_PAGE_LEVEL_GENERATION_IMPLEMENTATION_REPORT.md` — 页面级组卷详细实施报告
 
-开始工作前必须先读取并严格遵守项目根目录中的：
+---
 
-```text
-AGENTS.md
-CLAUDE.md
-REASONIX.md（若存在）
+## 二、已修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `backend/app/main.py` | 新增 `SelfTestRequest.generation_mode` 字段；自测题路由透传 `generation_mode`；新增 `_build_docx_response()`、`_build_pdf_response()`；新增 `POST /api/export/self-test/docx`、`POST /api/export/document/docx`、`POST /api/export/document/pdf` |
+| `backend/app/services/self_test_service.py` | **重写为页面级组卷**：`_build_page_units()`、`_merge_page_text()`、`_assign_page_evidence()`、页面蓝图标验、fusion 概念卡/关系识别/融合组构建、fallback 蓝图、页面级结果校验 |
+| `frontend/src/App.tsx` | 自测题设置增加 `generationMode` 控制；E 编号点击来源预览（`handleSelfTestSourceClick`）；自测题来源区域展开/高亮/滚动；导出 PDF/Word 按钮 |
+| `frontend/src/types.ts` | 新增 `QuizGenerationMode` 类型、`QuizSettings.generationMode` 字段；新增 `ExportDocumentRequest` 类型 |
+| `frontend/src/api.ts` | 新增 `exportDocumentDocx()`、`exportDocumentPdf()` 函数 |
+| `src/llm_deepseek.py` | 未修改；`post_chat_completions()` 已有重试机制（max_attempts=3，支持 SSL/Connection/Timeout/429/5xx 重试） |
+
+---
+
+## 三、single_page 最终流程
+
+```
+1. collect_chunks_by_scope() → 获取所有 Chunk
+2. _build_page_units(chunks) → 按 source_path + 页码分组形成页面单元
+3. _representative_pages(pages, target_count) → 页面级均衡抽样
+4. _assign_page_evidence(pages) → 页面内轮询分配 E 编号
+5. LLM 蓝图生成（页面级约束 prompt）
+6. _validate_blueprint() → 页面级校验
+7. 校验失败 → _fallback_blueprint() → 本地合法蓝图
+8. LLM 正式出题
+9. _validate_final_answer() → 页面级结果校验
+10. 校验失败 → LLM 自动修复（最多一次）
+11. 返回结果
 ```
 
-这些规则文件是硬性边界。
+---
 
-## 二、当前已经完成的功能
+## 四、fusion 最终流程
 
-项目目前已经具备：
-
-- 课程资料上传、管理、重命名、删除
-- PDF / PPT / PPTX 页面预览
-- ChromaDB 建库与检索
-- 普通智能问答
-- 来源依据卡片与页面跳转
-- 资料概览
-- 复习提纲
-- 资料整理 / Longform
-- 自测题设置、生成、结果展示
-- 历史记录
-- Word 导出
-- PDF 直接下载
-- AI 设置
-- 等待动画
-
-## 三、最近完成的关键修改
-
-### 1. 自测题已经独立于普通问答
-
-旧逻辑：
-
-```text
-自测题设置
-→ 生成提示词
-→ 填入普通问答输入框
-→ 调用 /qa
-→ 按高相关度 Chunk 出题
+```
+1-4. 同 single_page（建页面单元、抽样、分配 E 编号）
+5. _extract_page_concept_cards() → LLM 提取页面概念卡
+6. _validate_concept_cards() → 角色/概念/事实校验
+7. _build_fusion_groups() → 页面关系评分 → 融合组
+8. 无可靠融合组 → 降级 single_page
+9. LLM 蓝图（fusion 约束 prompt，填空题 single_page，选择/简答融合）
+10. _validate_blueprint() → 包含 fusion 特有校验
+11. 校验失败 → _fallback_blueprint() → 本地蓝图（含 fusion 轮换）
+12-14. 同 single_page
 ```
 
-当前逻辑：
+---
 
-```text
-点击“开始出题”
-→ 前端直接调用 /self-test
-→ 后端独立生成自测题
-→ 不再经过问题输入框
+## 五、页面证据单元最终结构
+
+```python
+{
+    "page_id": "P001",
+    "page_key": "source_key|slide:1",
+    "source_key": "source_path_normalized",
+    "source_path": "相对路径",
+    "file_name": "文件名",
+    "file_type": "pdf/pptx",
+    "location_type": "slide" | "page" | "chunk_fallback",
+    "location_number": 1,
+    "metadata_quality": "exact" | "fallback",
+    "page_number": None,          # 仅 PDF
+    "slide_number": 1,            # 仅 PPT
+    "chunks": [...],              # 该页所有 Chunk
+    "chunk_ids": [...],
+    "evidence_ids": ["E1", "E2"],
+    "text": "合并后的单页文本（≤2400 字符）",
+}
 ```
 
-接口：
+---
 
-```text
+## 六、蓝图字段
+
+```json
+{
+    "questions": [
+        {
+            "number": 1,
+            "type": "choice" | "fill" | "essay",
+            "difficulty": "easy" | "medium" | "hard",
+            "mode": "single_page" | "fusion",
+            "page_ids": ["P001"],
+            "relation": "定义与示例",
+            "relation_type": "definition_example",
+            "knowledge_point": "具体知识点",
+            "objective": "具体考查目标",
+            "evidence_ids": ["E1", "E2"]
+        }
+    ]
+}
+```
+
+---
+
+## 七、页面概念卡结构
+
+```json
+{
+  "page_id": "P001",
+  "concepts": ["核心概念名"],
+  "role": "definition" | "condition" | "mechanism" | "process" | "comparison" | "example" | "application" | "conclusion",
+  "key_facts": ["该页最重要的事实"],
+  "prerequisites": [],
+  "outcomes": []
+}
+```
+
+---
+
+## 八、融合组结构
+
+```python
+{
+    "group_id": "G001",
+    "relation_type": "definition_example",
+    "relation": "定义与示例",
+    "shared_concepts": ["核心概念"],
+    "page_ids": ["P001", "P003"],
+    "evidence_ids": ["E1", "E2", "E5", "E6"],
+    "score": 13,
+}
+```
+
+### 关系类型
+
+| 关系类型 | 说明 |
+|---|---|
+| `definition_example` | 定义与示例 |
+| `definition_application` | 定义与应用 |
+| `condition_result` | 条件与结果 |
+| `process_sequence` | 过程衔接 |
+| `mechanism_application` | 原理与应用 |
+| `theory_case` | 理论与案例 |
+| `comparison` | 概念比较 |
+| `cause_effect` | 条件与作用机制 |
+
+---
+
+## 九、程序校验规则
+
+### 蓝图校验
+
+- 题量、题型、顺序必须完全匹配
+- `single_page` 题只能有一个 `page_id`
+- `fusion` 题必须有 2～3 个 `page_id`
+- `evidence_ids` 必须在有效范围内
+- 每题证据不能跨越其未指定的页面
+- fusion 题必须匹配校验过的关系组
+- fusion 题证据必须覆盖全部融合页面
+- 可用页面充足时不得重复使用页面
+- 存在融合关系时至少包含一道融合题
+
+### 最终结果校验
+
+- 必须包含 `## 解析版` 等固定标题
+- 题目标题序列必须与蓝图一致（`### 第N题｜题型`）
+- 含〖依据〗的解析数量 ≥ 题目数
+- 〖依据〗只能引用该题 `evidence_ids` 中的 E 编号
+- `single_page` 题正式依据必须属于其唯一页面
+- `fusion` 题正式依据必须覆盖全部融合页面
+- 不允许引用未分配给该题的证据编号
+
+---
+
+## 十、Fallback / 降级规则
+
+1. 概念卡提取失败 → 无概念卡 → 无融合组 → 降级 single_page
+2. 模型蓝图未通过校验 → 使用 `_fallback_blueprint()`（本地合法蓝图）
+3. fusion 蓝图仍按页面轮换，填空题 single_page，选择/简答融合
+4. fallback 页面（缺失页码的 Chunk）不参与融合
+5. 可用页面少于题目 → 均衡复用页面
+6. 降级时 `warning` 会说明情况
+
+---
+
+## 十一、E 编号来源预览
+
+- 正则 `/E(\d+)/gi` 匹配 E1、E2、[E1]、【E1】
+- 点击后 `E1 → targetIndex = 0 → hits[0]`
+- `hitToPreviewTarget(hit)` → 尝试生成 Source Preview
+- 可预览 → 直接打开 Source Preview
+- 不可预览 → 展开来源区域 → `scrollIntoView` → 短暂高亮（1500ms）
+- 原有 `[1]`、`【1】` 引用行为保持
+
+---
+
+## 十二、PDF 导出问题根因和解决方法
+
+### 根因
+
+PDF 导出返回 404 不是因为自测题内容，也不是路由代码问题。原因是 8000 端口运行了**旧后端进程**，该进程启动时未加载新加的路由。
+
+### 解决方法
+
+修改后端代码或新增路由后，必须停止旧进程并重启正确项目目录下的后端：
+
+```powershell
+# 1. 检查 8000 端口
+$Listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
+
+if ($Listener) {
+    $Listener.OwningProcess | Sort-Object -Unique | ForEach-Object {
+        Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+}
+
+# 2. 使用当前项目目录启动
+Set-Location "G:\AI-Workstation\课程资料RAG查询"
+& ".\.venv\Scripts\python.exe" -m uvicorn backend.app.main:app --reload --reload-dir backend --reload-dir src --host 127.0.0.1 --port 8000
+```
+
+### 确认路由
+
+```http
+GET http://127.0.0.1:8000/openapi.json
+```
+
+应包含：
+
+```
+POST /api/export/document/docx
+POST /api/export/document/pdf
+POST /api/export/self-test/docx
 POST /api/subjects/{subject}/self-test
 ```
 
-普通智能问答仍使用：
+---
 
-```text
-POST /api/subjects/{subject}/qa
-```
+## 十三、正确启动命令
 
-### 2. 自测题已经改为均衡取材
-
-`self_test_service.py` 当前会：
-
-- 按 `source_filters` 收集当前选择范围内的 Chunk
-- 按 `source_path` 分组
-- 每个文件内按页码、幻灯片号、Chunk 序号排序
-- 从文件开头、中间、结尾均匀抽取
-- 多文件之间轮流取样
-- 每题约使用 3 个候选 Chunk
-- 最少目标 12 个 Chunk
-- 最多 36 个 Chunk
-- 单个 Chunk 传给模型时最多约 750 字符
-
-自测题已经不再使用普通问答的最高相似度 `top-k` 作为取材方式。
-
-### 3. Self-Test Logic V2 已应用
-
-当前流程：
-
-```text
-均衡抽取 Chunk
-→ 模型生成 JSON 组卷蓝图
-→ 后端校验蓝图
-→ 蓝图异常时使用本地降级蓝图
-→ 模型正式出题
-→ 后端校验正式结果
-→ 必要时自动修复一次
-→ 返回前端
-```
-
-已经加入：
-
-- JSON 蓝图解析
-- 题量校验
-- 题号校验
-- 题型顺序校验
-- 真实证据编号校验
-- 完全重复题干检测
-- 蓝图异常时本地降级
-- 正式结果不合格时最多自动修复一次
-- 根据题量动态设置 `max_tokens`
-- `warning` 返回资料覆盖和修复状态
-
-备份：
-
-```text
-backend/app/services/self_test_service.py.bak_logic_v2_20260609_111700
-```
-
-### 4. 前端旧自测题流程已清理
-
-已经删除或清理：
-
-- `buildSelfTestPrompt()`
-- `isSelfTestRequestRef`
-- `setQuestion(prompt)` 旧流程
-- 普通 `handleAsk()` 中的自测题分支
-
-当前：
-
-- 普通问答只调用 `/qa`
-- “开始出题”直接调用 `/self-test`
-
-### 5. Longform 已提速
-
-已完成：
-
-- 分组摘要 3 路并发
-- 根据目标字数动态控制组数和 Chunk 数
-- 分阶段等待动画
-- 资料整理结果写入历史
-
-### 6. PDF 已改为直接下载
-
-旧逻辑：
-
-```text
-点击 PDF
-→ window.print()
-→ 当前页面进入打印视图
-```
-
-当前逻辑：
-
-```text
-点击“导出 PDF”
-→ POST /api/export/document/pdf
-→ 后端生成临时 DOCX
-→ LibreOffice 转 PDF
-→ 浏览器直接下载 .pdf
-```
-
-已覆盖：
-
-- 资料概览
-- 复习提纲
-- 智能问答
-- 自测题
-- 资料整理
-
-备份：
-
-```text
-backend/app/main.py.bak_pdf_download_20260609_113053
-frontend/src/api.ts.bak_pdf_download_20260609_113053
-frontend/src/App.tsx.bak_pdf_download_20260609_113053
-```
-
-## 四、当前真正需要解决的问题
-
-目前自测题的组卷单位仍然是：
-
-```text
-Chunk
-```
-
-这会导致：
-
-- 一道题可能只围绕一个 Chunk
-- 同一页 PPT 被切成多个 Chunk 后，没有被当作一个整体
-- 当前不能由用户选择：
-  - 单页出题
-  - 融合出题
-
-下一步需要把核心组卷单位升级为：
-
-```text
-页面证据单元
-```
-
-## 五、已经确认的产品方案
-
-### 默认模式：单页出题
-
-准确含义：
-
-```text
-一道题主要依据一页 PPT 或一页 PDF
-```
-
-注意：
-
-- 不是“一题一个 Chunk”
-- 同一页可能有多个 Chunk，应先合并成一个页面证据单元
-- 整套题优先轮换不同页面
-- 页面数不足时才允许复用页面
-
-建议页面键：
-
-```python
-page_key = (
-    source_path,
-    slide_number or page_number,
-)
-```
-
-### 可选模式：融合出题
-
-准确含义：
-
-```text
-一道题综合 2～3 个存在明确关系的页面
-```
-
-可以是：
-
-- 同一 PPT 的不同页面
-- 不同 PPT 的相关页面
-- 定义页 + 原理页
-- 概念页 + 示例页
-- 理论页 + 应用页
-- 概念 A + 概念 B 的比较页
-- 过程页 + 结果页
-
-不能随机拼接无关页面。
-
-融合关系示例：
-
-```text
-定义 + 过程 + 应用
-概念 + 示例
-原理 + 案例
-条件 + 结果
-概念 A 与概念 B 的比较
-```
-
-最多融合 3 个页面。
-
-## 六、前端需要修改的内容
-
-### 1. 新增类型
-
-在 `frontend/src/types.ts` 增加：
-
-```typescript
-export type QuizGenerationMode =
-  | "single_page"
-  | "fusion";
-```
-
-给 `QuizSettings` 增加：
-
-```typescript
-generationMode: QuizGenerationMode;
-```
-
-默认：
-
-```typescript
-generationMode: "single_page"
-```
-
-### 2. 自测题设置界面增加选项
-
-在 `frontend/src/App.tsx` 的“自测题生成设置”中增加：
-
-```text
-出题方式
-
-● 单页出题（默认）
-  每道题主要依据一页 PPT 或 PDF，整套题均衡覆盖不同页面
-
-○ 融合出题
-  综合 2～3 个相关页面生成综合题
-```
-
-保留现有：
-
-- 题型选择
-- 题目数量
-- 答案模式
-- 结果区
-- 来源预览
-- 历史记录
-- Word / PDF 导出
-
-### 3. 请求体增加参数
-
-```json
-{
-  "source_filters": [],
-  "type_configs": [],
-  "answer_mode": "dual",
-  "generation_mode": "single_page"
-}
-```
-
-同步修改：
-
-```text
-frontend/src/types.ts
-frontend/src/api.ts
-frontend/src/App.tsx
-```
-
-## 七、后端请求模型需要修改
-
-在 `backend/app/main.py` 的 `SelfTestRequest` 增加：
-
-```python
-generation_mode: Literal[
-    "single_page",
-    "fusion",
-] = "single_page"
-```
-
-调用 `generate_self_test()` 时传入：
-
-```python
-generation_mode=request.generation_mode
-```
-
-接口路径不变：
-
-```text
-POST /api/subjects/{subject}/self-test
-```
-
-## 八、self_test_service.py 的实现方向
-
-主要文件：
-
-```text
-backend/app/services/self_test_service.py
-```
-
-### 1. 从 Chunk 级改为页面级
-
-建议新增：
-
-```python
-_page_key()
-_group_chunks_into_pages()
-_build_page_units()
-_sample_page_units()
-```
-
-页面证据单元建议结构：
-
-```python
-{
-    "page_id": "S1-P8",
-    "source_path": "...",
-    "file_name": "...",
-    "file_type": "pptx",
-    "page_number": None,
-    "slide_number": 8,
-    "chunk_ids": ["..."],
-    "text": "该页多个 Chunk 合并后的文本",
-    "evidence_ids": ["E3", "E4"]
-}
-```
-
-### 2. 单页模式规则
-
-当：
-
-```text
-generation_mode = "single_page"
-```
-
-必须满足：
-
-- 每道题只绑定一个 `page_id`
-- 可以引用该页面内多个 `evidence_ids`
-- 所有证据必须来自同一 `source_path`
-- 页码或幻灯片号必须一致
-- 不同题目优先使用尚未出过题的页面
-- 页面数不足时才复用
-
-蓝图示例：
-
-```json
-{
-  "number": 1,
-  "type": "choice",
-  "difficulty": "easy",
-  "mode": "single_page",
-  "page_ids": ["S2-P8"],
-  "evidence_ids": ["E3", "E4"],
-  "knowledge_point": "DFA 的状态转移",
-  "objective": "考查对该页核心概念的理解"
-}
-```
-
-### 3. 融合模式规则
-
-当：
-
-```text
-generation_mode = "fusion"
-```
-
-建议新增“页面概念和关系提取”阶段：
-
-```text
-页面证据单元
-→ 提取概念、角色、关键事实
-→ 识别页面关系
-→ 形成融合页面组
-→ 生成蓝图
-→ 正式出题
-```
-
-页面概念卡示例：
-
-```json
-{
-  "page_id": "S2-P8",
-  "concepts": ["DFA", "状态转移"],
-  "role": "mechanism",
-  "key_fact": "当前状态和输入符号唯一确定下一状态"
-}
-```
-
-角色限制为：
-
-```text
-definition
-condition
-mechanism
-process
-comparison
-example
-application
-conclusion
-```
-
-融合组示例：
-
-```json
-{
-  "group_id": "G3",
-  "mode": "fusion",
-  "relation": "定义 + 过程 + 应用",
-  "page_ids": ["S1-P3", "S1-P6", "S2-P4"],
-  "evidence_ids": ["E2", "E7", "E12"]
-}
-```
-
-程序校验：
-
-- `page_ids` 至少 2 个，最多 3 个
-- `relation` 不能为空
-- `evidence_ids` 必须真实存在
-- `page_ids` 必须与证据实际页面一致
-- 页面之间必须有可解释关系
-- 没有合适关系时允许降级为单页题，不能硬拼
-
-### 4. 不同题型的融合建议
-
-即使用户选择融合模式，也不应强制所有题融合：
-
-```text
-选择题：约 30%～50% 使用融合页面
-填空题：以单页为主
-简答/大题：优先融合 2～3 个页面
-```
-
-### 5. 蓝图 JSON 增加字段
-
-现有字段：
-
-- number
-- type
-- difficulty
-- knowledge_point
-- objective
-- evidence_ids
-
-新增：
-
-```json
-{
-  "mode": "single_page 或 fusion",
-  "relation": "",
-  "page_ids": []
-}
-```
-
-## 九、已知稳定性问题
-
-曾出现：
-
-```text
-SSL: UNEXPECTED_EOF_WHILE_READING
-```
-
-位置：
-
-```text
-src/llm_deepseek.py
-post_chat_completions()
-```
-
-当前是否已经加入自动重试，尚未确认。下一会话先检查：
+### 后端开发（推荐）
 
 ```powershell
-Select-String `
-  -LiteralPath ".\src\llm_deepseek.py" `
-  -Pattern "max_attempts|SSLError|ConnectionError|Timeout|retry_statuses" |
-  Select-Object LineNumber, Line
-```
+$Root = "G:\AI-Workstation\课程资料RAG查询"
 
-如果没有输出，再单独补稳定性修复：
+# 停止旧的 8000 端口进程
+$Listener = Get-NetTCPConnection `
+    -LocalPort 8000 `
+    -State Listen `
+    -ErrorAction SilentlyContinue
 
-- SSL 错误重试
-- ConnectionError 重试
-- Timeout 重试
-- HTTP 429 / 500 / 502 / 503 / 504 重试
-- 最多共尝试 3 次
-- API Key 错误、参数错误等永久性 4xx 不重试
+if ($Listener) {
+    $Listener.OwningProcess |
+        Sort-Object -Unique |
+        ForEach-Object {
+            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+        }
+    Start-Sleep -Seconds 1
+}
 
-前端还需确认：
-
-- 开始新一轮出题前清空旧 `selfTestResult`
-- 后端返回 `error_type` 或空 `answer` 时不能把 warning 当新题目
-- 失败后不能继续显示上一次题目
-
-## 十、启动方式
-
-### 后端开发模式
-
-```powershell
-cd "G:\AI-Workstation\课程资料RAG查询"
+Set-Location -LiteralPath $Root
 
 & ".\.venv\Scripts\python.exe" `
     -m uvicorn backend.app.main:app `
@@ -585,177 +282,56 @@ cd "G:\AI-Workstation\课程资料RAG查询"
     --port 8000
 ```
 
-如果已有 `start_backend.ps1`：
+### 后端稳定（展示/答辩）
 
 ```powershell
-.\start_backend.ps1
-```
-
-稳定模式：
-
-```powershell
-.\start_backend.ps1 -NoReload
+Set-Location "G:\AI-Workstation\课程资料RAG查询"
+& ".\.venv\Scripts\python.exe" -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
 ### 前端
 
 ```powershell
-cd "G:\AI-Workstation\课程资料RAG查询\frontend"
-
+Set-Location "G:\AI-Workstation\课程资料RAG查询\frontend"
 npm run dev
 ```
 
-## 十一、修改边界
+---
 
-禁止：
+## 十四、已完成静态检查
 
-- 运行 Git
-- 安装或升级依赖
-- 读取 `.env`
-- 读取或输出 API Key、token、secret
-- 修改正式 ChromaDB
-- 重建课程索引
-- 删除课程资料
-- 做无关重构
-- 破坏普通问答
-- 破坏历史记录
-- 破坏来源预览
-- 破坏 Word / PDF 导出
+- `backend/app/main.py` — py_compile 通过
+- `backend/app/services/self_test_service.py` — py_compile 通过
+- `frontend` — `npx tsc --noEmit` 通过
+- PDF 路由 — OpenAPI 确认存在，浏览器 PDF 导出实际成功
+- E 编号预览 — 代码已写入并通过 TypeScript 检查
 
-允许：
+---
 
-```powershell
-python -m py_compile ...
-cd frontend
-npx tsc --noEmit
-```
+## 十五、仍需手动测试的场景
 
-## 十二、推荐实施顺序
+1. 单个 PPT 的 single_page 出题
+2. 多个 PPT 的 single_page 出题
+3. 单个 PPT 跨页 fusion
+4. 多个 PPT 跨文件 fusion
+5. 页面数少于题目数（均衡复用）
+6. 页面数多于题目数（不重复页面）
+7. 选择题、填空题、简答题混合
+8. inline / end / dual 三种答案模式
+9. E1/E2 点击打开 PPT/PDF 页面预览
+10. 来源预览（E 编号无法生成预览时展开并高亮）
+11. 历史记录中的自测题
+12. Word 导出（self-test/docx 和 document/docx）
+13. PDF 导出（LibreOffice 需已安装）
+14. 无可靠融合关系时降级为 single_page，warning 正确
+15. DeepSeek 短暂网络错误后自动重试
 
-### 第一步：只读确认
+---
 
-先检查：
+## 十六、下一步可优化
 
-- `QuizSettings`
-- 自测题设置 UI
-- `SelfTestRequest`
-- `generateSelfTest()`
-- `generate_self_test()`
-- 当前蓝图解析与校验代码
-- DeepSeek 重试是否存在
-
-不要直接大范围修改。
-
-### 第二步：接入 generation_mode
-
-先打通最小链路：
-
-```text
-前端单页/融合选项
-→ 请求体 generation_mode
-→ 后端模型接收
-→ self_test_service 收到参数
-```
-
-### 第三步：实现默认单页模式
-
-优先完成：
-
-```text
-Chunk → 页面单元
-→ 页面级抽样
-→ 每题绑定一个页面
-→ 页面级蓝图校验
-```
-
-### 第四步：实现融合模式
-
-再增加：
-
-```text
-页面概念卡
-→ 页面关系
-→ 融合页面组
-→ 融合蓝图校验
-```
-
-### 第五步：测试
-
-至少测试：
-
-1. 只选一个 PPT，单页模式
-2. 选多个 PPT，单页模式
-3. 只选一个 PPT，融合模式
-4. 选多个 PPT，融合模式
-5. 页面数少于题目数
-6. 页面数多于题目数
-7. 多题型混合
-8. inline / end / dual
-9. 来源预览
-10. Word 导出
-11. PDF 导出
-12. 历史记录
-13. DeepSeek 网络短暂中断
-
-## 十三、下一会话直接发送的开场消息
-
-```text
-请继续处理项目：
-
-G:\AI-Workstation\课程资料RAG查询
-
-先读取并严格遵守项目根目录中的 AGENTS.md、CLAUDE.md、REASONIX.md（若存在）。
-
-我已经完成：
-1. 自测题独立 /self-test 接口；
-2. 前端点击“开始出题”直接生成，不再经过问题输入框；
-3. 自测题均衡抽取 Chunk；
-4. JSON 组卷蓝图、程序校验、本地降级蓝图和最多一次自动修复；
-5. PDF 改为后端生成并直接下载；
-6. Longform 并发提速。
-
-现在要实现：
-- 默认 single_page：一道题主要依据一页 PPT/PDF，同一页多个 Chunk 可合并；
-- 可选 fusion：一道题融合 2～3 个有关联页面，可以同一 PPT 跨页或跨 PPT；
-- 前端增加“单页出题 / 融合出题”，默认 single_page；
-- 请求体增加 generation_mode；
-- 后端从 Chunk 级组卷改为页面级组卷；
-- 单页模式强制每题只绑定一个页面；
-- 融合模式先识别页面概念和关系，再组合页面；
-- 保留现有题型、答案模式、历史记录、来源预览、Word/PDF 导出；
-- 不修改普通问答逻辑。
-
-请先只读检查当前代码，不要直接修改。先给出：
-1. 当前相关代码位置；
-2. 最小修改文件清单；
-3. 页面证据单元的数据结构；
-4. 单页模式的校验规则；
-5. 融合模式的关系提取与校验方案；
-6. 分阶段实施计划。
-
-另外先检查 src/llm_deepseek.py 是否已经具备 SSL/连接/超时自动重试；如果没有，列为稳定性补丁，但不要和页面级组卷混在同一个大补丁中。
-```
-
-## 十四、一句话总结
-
-当前自测题已经从“普通相似度问答出题”升级为“独立、均衡取材、JSON 蓝图、程序校验的组卷流程”。
-
-下一步把核心组卷单位从：
-
-```text
-Chunk
-```
-
-升级为：
-
-```text
-页面证据单元
-```
-
-并提供：
-
-```text
-默认单页出题
-+
-可选融合出题
-```
+1. 完整 LLM 回归测试（需要 DeepSeek API key 和建好的资料库）
+2. LibreOffice 转换锁（多线程并发预览保护）
+3. 融合关系可视化（前端展示 P001 ↔ P003 关系）
+4. 更多页面样本时的概念卡提取质量调优
+5. 自测题编辑/重新生成（保留上次设置）

@@ -107,6 +107,7 @@ class SelfTestRequest(BaseModel):
     source_filters: list[str] = Field(default_factory=list)
     type_configs: list[SelfTestTypeConfig] = Field(default_factory=list)
     answer_mode: Literal["inline", "end", "dual"] = "inline"
+    generation_mode: Literal["single_page", "fusion"] = "single_page"
 
 
 class LongformRequest(BaseModel):
@@ -1065,6 +1066,7 @@ def subject_self_test(subject: str, request: SelfTestRequest) -> dict:
             source_filters=request.source_filters or None,
             type_configs=type_configs,
             answer_mode=request.answer_mode,
+            generation_mode=request.generation_mode,
         )
     except HTTPException:
         raise
